@@ -1,0 +1,20 @@
+---
+# using show version cause iostype not reporting currectly on some ios-xe devices
+# https://github.com/ansible-collections/cisco.ios/pull/69
+- name: show version
+  ios_command:
+    commands: "show version"
+  register: sh_version
+
+- name: Cisco IOS device update
+  include_tasks: ios.yml
+  when: 
+    - ansible_net_iostype == "IOS"
+    - "'IOS' in sh_version.stdout[0]"
+    - "'IOS-XE' not in sh_version.stdout[0]"
+
+- name: Cisco IOS-XE device update
+  include_tasks: ios_xe.yml
+  when: 
+    # - ansible_net_iostype == "IOS-XE"  # for when pull is merged
+    - "'IOS-XE' in sh_version.stdout[0]"

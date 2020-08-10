@@ -1,0 +1,149 @@
+---
+- name: Gather facts
+  ios_facts:
+    gather_subset: hardware
+
+- name: Check firmware compliance
+  script: "files/version_lookup.py --model='{{ ansible_net_model }}' --version='{{ ansible_net_version }}' --image='{{ ansible_net_image }}'"
+  register: version_lookup
+  changed_when: false
+
+- name: Script results to JSON
+  set_fact:
+    r_json: "{{ version_lookup.stdout | from_json }}"
+
+- fail:
+    msg: "{{ r_json.msg }} - {{ ansible_net_model }} - {{ ansible_net_version }} - {{ ansible_net_image }}"
+  when: not r_json.success
+
+- name: Change IOS image if not compliant
+  block:
+    - debug:
+        msg: "{{ inventory_hostname }} requires firmware update, target version is {{ r_json.target_os }}, current version is {{ ansible_net_version }}"
+
+    - name: Check if file exists on flash
+      ios_command:
+        commands:
+          - "show flash: | inc {{ r_json.target_file }}"
+      register: file_exists
+
+    - debug:
+        msg: "{{ r_json.target_file }} already exists on device {{file_exists.stdout}}"
+      when: file_exists.stdout|bool
+
+    - stat:
+        path: "{{ firmware_file_dir }}{{ r_json.target_file }}"
+        checksum_algorithm: md5
+      register: firm
+
+    - name: Check space on device
+      block:
+        - fail:
+            msg: "Not enough space on target device"
+          when: (firm['stat']['size'] / 1024) > ansible_net_filesystems_info['flash:']['spacefree_kb']
+      rescue:
+        - name: Remove any IOS version 12
+          ios_command:
+            commands:
+              - "del /r /f *-mz.122-*"
+        - name: Gather facts
+          ios_facts:
+            gather_subset: hardware
+        - fail:
+            msg: "Not enough space on target device"
+          when: (firm['stat']['size'] / 1024) > ansible_net_filesystems_info['flash:']['spacefree_kb']
+      when: not file_exists.stdout|bool
+
+    - debug:
+        msg: 
+          - "Current free space on device: {{ ansible_net_filesystems_info['flash:']['spacefree_kb'] }}kb"
+          - "New IOS file size: {{ firm['stat']['size'] / 1024 }}kb"
+          - "Remaining space after upgrade: {{ ansible_net_filesystems_info['flash:']['spacefree_kb']|int - (firm['stat']['size'] / 1024)|int }}kb"
+
+    - name: Transfer file
+      block:
+        - name: Enable SCP for transfer
+          ios_config:
+            lines:
+              - "ip scp server enable"   
+
+        - name: Copy image via SCP
+          net_put:
+            src: "{{ firmware_file_dir }}{{ r_json.target_file }}"
+            dest: "flash:/{{ r_json.target_file }}"
+            mode: binary
+            protocol: scp
+          vars:
+            ansible_command_timeout: 900
+
+      rescue:
+        - debug:
+            msg: "SCP transfer failed, falling back to TFTP"
+
+        - name: Setup TFTP blocksize
+          ios_config:
+            lines:
+              - "ip tftp blocksize 8192"
+
+          ignore_errors: True  # ignore blocksize error if devices are running 12.2 also, wtf
+        - name: Set file prompts to quiet
+          ios_config:
+            lines:
+              - "file prompt quiet"
+
+        - name: Copy image via TFTP
+          ios_command:
+            commands:
+              - "copy tftp://{{ tftp_firmware_server }}/{{ r_json.target_file }} flash"
+            wait_for:
+              - result[0] contains [OK
+              - result[0] contains !
+          vars:
+            ansible_command_timeout: 600
+
+        - name: Restore file prompt settings to default
+          ios_config:
+            lines:
+              - "no file prompt quiet"
+      when: not file_exists.stdout|bool
+
+    - name: Set boot to new version
+      ios_config:
+        lines:
+          - "boot system flash:{{ r_json.target_file }}"
+        match: exact
+        save_when: always  # save so reboot doesn't prompt to save and therefore fail
+    
+    - debug:
+        msg: "Device rebooting in 1 minute, be patient, get a coffee."
+
+    - name: Reboot device
+      ios_command:
+        commands:
+          - command: "reload in 1\n"  # gives time for command to be sent to any downstream devices
+            prompt: "[confirm]"
+            answer: "\r"
+          
+    - name: Wait for device to reboot
+      wait_for_connection:
+        delay: 180  # delay must be 60+ seconds due to above delay
+        sleep: 5
+        timeout: 900
+
+    - name: Gather facts
+      ios_facts:
+        gather_subset: min
+  when: 
+    - r_json.update_required is defined
+    - r_json.update_required
+
+- block:
+  - name: Assert version is correct
+    assert:
+      that:
+        - r_json.target_os == ansible_net_version
+      success_msg: "{{ inventory_hostname }} is running target version {{ r_json.target_os }}"
+      fail_msg: "{{ inventory_hostname }} is NOT running target version {{ r_json.target_os }}"
+    when:
+      - r_json.success
+      - r_json.target_os is defined

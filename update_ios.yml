@@ -1,0 +1,17 @@
+---
+- hosts: all
+  connection: network_cli
+  become: yes
+  gather_facts: yes
+
+  ### VARS that need to be declared
+  # tftp_firmware_server: (DNS/IP)
+  # firmware_file_dir: (path to directory with firmware)
+
+  ### include collections if needed
+  # collections:
+  #   - cisco.ios
+
+  tasks:
+    - include_role:
+        name: update_os
