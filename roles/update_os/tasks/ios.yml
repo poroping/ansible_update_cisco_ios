@@ -74,7 +74,7 @@
             mode: binary
             protocol: scp
           vars:
-            ansible_command_timeout: 900
+            ansible_command_timeout: 1200  # scp takes longer blargh
 
       rescue:
         - debug:
